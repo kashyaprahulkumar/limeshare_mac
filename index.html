@@ -1623,6 +1623,7 @@
 
             const fileName = incomingMeta.name;
 
+            // 1. Give path / choose destination in the STARTING
             if ('showSaveFilePicker' in window) {
                 try {
                     directFileHandle = await window.showSaveFilePicker({
@@ -1641,14 +1642,14 @@
                     directWritableStream = null;
                 }
             } else {
-                // Fallback for browsers without showSaveFilePicker (e.g. mobile Safari / OPFS)
+                // Mac Tablet / Safari fallback: initialize direct disk writer on physical flash storage at start
                 await initDiskWriter(fileName);
             }
 
             receivedChunks = [];
             receivedSize = 0;
 
-            // Inform sender to start streaming chunks directly to our disk stream
+            // 2. Begin streaming chunks directly into the pre-authorized storage path
             sendControlMessage(activeDataConn, { type: 'accept', name: fileName, resumeOffset: 0 });
             showProgressUI(fileName, false, incomingMeta.size);
             updateProgressUI(0, incomingMeta.size);
@@ -1787,14 +1788,12 @@
                 }
 
                 if (directWritableStream) {
-                    // DIRECT HARD DISK STREAM COMPLETED!
-                    // Close the stream so the OS flushes the file.
+                    // DIRECT HARD DISK STREAM COMPLETED (Chromium on Mac / PC):
+                    // Stream closes and flushes to the folder selected in the starting.
                     await directWritableStream.close();
                     directWritableStream = null;
                     directFileHandle = null;
 
-                    // The file is ALREADY on the hard disk in the chosen destination folder!
-                    // No download prompt needed, no URL.createObjectURL, zero RAM used!
                     const fileObj = {
                         name: meta.name,
                         size: meta.size,
@@ -1810,7 +1809,8 @@
                     addFileToHistory(fileObj);
                     showToast(`Saved ${meta.name} directly to hard disk!`, "emerald");
                 } else if (opfsWritable || meta.size >= DIRECT_STORAGE_THRESHOLD) {
-                    // OPFS fallback mode
+                    // MAC TABLET / SAFARI DIRECT DISK STREAM:
+                    // File is already written chunk-by-chunk to physical flash storage via OPFS!
                     if (opfsWritable) {
                         try {
                             await opfsWritable.close();
@@ -1818,36 +1818,24 @@
                         } catch(e) {}
                     }
 
+                    let fileUrl = null;
                     if (opfsFileHandle) {
                         try {
                             const diskFile = await opfsFileHandle.getFile();
-                            const url = URL.createObjectURL(diskFile);
-                            const a = document.createElement('a');
-                            a.href = url;
-                            a.download = meta.name;
-                            document.body.appendChild(a);
-                            a.click();
-                            setTimeout(() => {
-                                if (document.body.contains(a)) document.body.removeChild(a);
-                                URL.revokeObjectURL(url);
-                                try { if (opfsFileHandle) opfsFileHandle.remove(); } catch(e) {}
-                                opfsFileHandle = null;
-                            }, 1500);
-                        } catch(e) {
-                            if (chunksToSave.length > 0) {
-                                saveAndDownloadDirect(chunksToSave, meta.name, meta.mime);
-                            }
-                        }
-                    } else if (chunksToSave.length > 0) {
-                        saveAndDownloadDirect(chunksToSave, meta.name, meta.mime);
+                            fileUrl = URL.createObjectURL(diskFile);
+                        } catch(e) {}
                     }
 
+                    // ZERO PROMPTS AT THE END:
+                    // The path and save action were locked in at the starting.
+                    // We DO NOT call an unprompted a.click() here, which eliminates the annoying
+                    // "Do you want to download..." dialog on Mac tablets and Safari.
                     const fileObj = {
                         name: meta.name,
                         size: meta.size,
                         mime: meta.mime || detectMimeByName(meta.name),
                         blob: null, 
-                        url: null,  
+                        url: fileUrl,  
                         isSent: false,
                         isDiskSaved: true,
                         transferSpeed: avgSpeed,
@@ -1855,7 +1843,7 @@
                     };
                     saveFileToDB(fileObj);
                     addFileToHistory(fileObj);
-                    showToast(`Saved ${meta.name} to storage!`, "emerald");
+                    showToast(`Saved ${meta.name} directly to device storage!`, "emerald");
                 } else {
                     // < 100 MB: Save to RAM and Files & History
                     saveReceivedFile(chunksToSave, meta.name, meta.mime, avgSpeed);
