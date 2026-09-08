@@ -8,6 +8,15 @@
     <meta name="description" content="LimeShare is a private, lightning-fast peer-to-peer (P2P) local Wi-Fi file sharing tool. Direct device-to-device file transfer with zero cloud storage.">
     <meta name="theme-color" content="#84cc16">
 
+    <!-- Safari (macOS + iOS) ignores the beforeinstallprompt event entirely, so it
+         relies on these Apple-specific meta tags for "Add to Dock" / home screen
+         installs instead of the Web App Manifest alone. -->
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="LimeShare">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="apple-touch-icon" href="https://placehold.co/180x180/84cc16/ffffff?text=LS">
+
     <!-- Web App Manifest for PWA Support -->
     <link rel="manifest" id="pwa-manifest-link">
 
@@ -700,6 +709,14 @@
         let isTransferring = false;
         let currentTransferFile = null;
         let lastAttemptedFile = null;
+        // Monotonically-incrementing id identifying "which send attempt is the live one".
+        // A boolean cancel flag isn't enough here: cancelling and starting the next file
+        // both happen synchronously back-to-back, so a boolean can flip cancelled -> not
+        // cancelled again before the still-running send loop (paused on an `await`) ever
+        // gets a chance to check it — the old loop then keeps sending chunks that get
+        // interleaved with the next file on the wire. A ratcheting session id can't be
+        // un-set that way: any older loop's captured id will simply never match again.
+        let transferSessionId = 0;
         
         let discoveredPeers = {}; 
         let presenceInterval = null;
@@ -748,8 +765,18 @@
         });
 
         function isAppleDevice() {
-            return /iPad|iPhone|iPod/.test(navigator.userAgent) || 
-                   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+            // The previous check only matched iPadOS (which reports as "MacIntel" with
+            // touch points) and missed real Macs entirely, since a MacBook running
+            // Safari has maxTouchPoints === 0. It's widened here to also catch desktop
+            // Safari on macOS, since that's the actual "Mac support" case.
+            const isRealMac = navigator.platform === 'MacIntel' && navigator.maxTouchPoints === 0;
+            const isIpadOS = navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1;
+            return /iPad|iPhone|iPod|Macintosh/.test(navigator.userAgent) || isRealMac || isIpadOS;
+        }
+
+        function isSafariBrowser() {
+            const ua = navigator.userAgent;
+            return /Safari/.test(ua) && !/Chrome|Chromium|CriOS|Edg|OPR/.test(ua);
         }
 
         function isMobileDevice() {
@@ -1537,10 +1564,15 @@
                 abortTransfer();
             }
             else if (msg.type === 'text_snippet') {
-                playChime('text');
-                renderTextSnippet(msg.text, false, true);
-                switchDockTab('clip');
-                showToast("Received live text snippet", "lime");
+                // Coerce/limit remote-supplied text: a malicious or buggy peer could send
+                // a non-string value or an enormous payload over the data channel.
+                const safeText = String(msg.text ?? '').slice(0, 20000);
+                if (safeText) {
+                    playChime('text');
+                    renderTextSnippet(safeText, false, true);
+                    switchDockTab('clip');
+                    showToast("Received live text snippet", "lime");
+                }
             }
             else if (msg.type === 'voice_snippet') {
                 playChime('text');
@@ -1555,10 +1587,10 @@
             }
             else if (msg.type === 'accept') {
                 if (currentTransferFile && (!msg.name || msg.name === currentTransferFile.name)) {
-                    startStreamingChunks(currentTransferFile, msg.resumeOffset || 0);
+                    startStreamingChunks(currentTransferFile, msg.resumeOffset || 0, transferSessionId);
                 } else if (lastAttemptedFile && (!msg.name || msg.name === lastAttemptedFile.name)) {
                     currentTransferFile = lastAttemptedFile;
-                    startStreamingChunks(currentTransferFile, msg.resumeOffset || 0);
+                    startStreamingChunks(currentTransferFile, msg.resumeOffset || 0, transferSessionId);
                 }
             }
             else if (msg.type === 'end') {
@@ -1623,7 +1655,6 @@
 
             const fileName = incomingMeta.name;
 
-            // 1. Give path / choose destination in the STARTING
             if ('showSaveFilePicker' in window) {
                 try {
                     directFileHandle = await window.showSaveFilePicker({
@@ -1642,14 +1673,14 @@
                     directWritableStream = null;
                 }
             } else {
-                // Mac Tablet / Safari fallback: initialize direct disk writer on physical flash storage at start
+                // Fallback for browsers without showSaveFilePicker (e.g. mobile Safari / OPFS)
                 await initDiskWriter(fileName);
             }
 
             receivedChunks = [];
             receivedSize = 0;
 
-            // 2. Begin streaming chunks directly into the pre-authorized storage path
+            // Inform sender to start streaming chunks directly to our disk stream
             sendControlMessage(activeDataConn, { type: 'accept', name: fileName, resumeOffset: 0 });
             showProgressUI(fileName, false, incomingMeta.size);
             updateProgressUI(0, incomingMeta.size);
@@ -1721,6 +1752,9 @@
         function cancelCurrentTransfer() {
             isTransferCancelled = true;
             isTransferPaused = false;
+            // Invalidate whatever send loop is currently running, immediately and
+            // unconditionally — see the comment on transferSessionId's declaration.
+            transferSessionId++;
 
             if (activeDataConn && activeDataConn.open) {
                 sendControlMessage(activeDataConn, { type: 'transfer_cancel' });
@@ -1788,12 +1822,14 @@
                 }
 
                 if (directWritableStream) {
-                    // DIRECT HARD DISK STREAM COMPLETED (Chromium on Mac / PC):
-                    // Stream closes and flushes to the folder selected in the starting.
+                    // DIRECT HARD DISK STREAM COMPLETED!
+                    // Close the stream so the OS flushes the file.
                     await directWritableStream.close();
                     directWritableStream = null;
                     directFileHandle = null;
 
+                    // The file is ALREADY on the hard disk in the chosen destination folder!
+                    // No download prompt needed, no URL.createObjectURL, zero RAM used!
                     const fileObj = {
                         name: meta.name,
                         size: meta.size,
@@ -1809,8 +1845,7 @@
                     addFileToHistory(fileObj);
                     showToast(`Saved ${meta.name} directly to hard disk!`, "emerald");
                 } else if (opfsWritable || meta.size >= DIRECT_STORAGE_THRESHOLD) {
-                    // MAC TABLET / SAFARI DIRECT DISK STREAM:
-                    // File is already written chunk-by-chunk to physical flash storage via OPFS!
+                    // OPFS fallback mode
                     if (opfsWritable) {
                         try {
                             await opfsWritable.close();
@@ -1818,24 +1853,36 @@
                         } catch(e) {}
                     }
 
-                    let fileUrl = null;
                     if (opfsFileHandle) {
                         try {
                             const diskFile = await opfsFileHandle.getFile();
-                            fileUrl = URL.createObjectURL(diskFile);
-                        } catch(e) {}
+                            const url = URL.createObjectURL(diskFile);
+                            const a = document.createElement('a');
+                            a.href = url;
+                            a.download = meta.name;
+                            document.body.appendChild(a);
+                            a.click();
+                            setTimeout(() => {
+                                if (document.body.contains(a)) document.body.removeChild(a);
+                                URL.revokeObjectURL(url);
+                                try { if (opfsFileHandle) opfsFileHandle.remove(); } catch(e) {}
+                                opfsFileHandle = null;
+                            }, 1500);
+                        } catch(e) {
+                            if (chunksToSave.length > 0) {
+                                saveAndDownloadDirect(chunksToSave, meta.name, meta.mime);
+                            }
+                        }
+                    } else if (chunksToSave.length > 0) {
+                        saveAndDownloadDirect(chunksToSave, meta.name, meta.mime);
                     }
 
-                    // ZERO PROMPTS AT THE END:
-                    // The path and save action were locked in at the starting.
-                    // We DO NOT call an unprompted a.click() here, which eliminates the annoying
-                    // "Do you want to download..." dialog on Mac tablets and Safari.
                     const fileObj = {
                         name: meta.name,
                         size: meta.size,
                         mime: meta.mime || detectMimeByName(meta.name),
                         blob: null, 
-                        url: fileUrl,  
+                        url: null,  
                         isSent: false,
                         isDiskSaved: true,
                         transferSpeed: avgSpeed,
@@ -1843,7 +1890,7 @@
                     };
                     saveFileToDB(fileObj);
                     addFileToHistory(fileObj);
-                    showToast(`Saved ${meta.name} directly to device storage!`, "emerald");
+                    showToast(`Saved ${meta.name} to storage!`, "emerald");
                 } else {
                     // < 100 MB: Save to RAM and Files & History
                     saveReceivedFile(chunksToSave, meta.name, meta.mime, avgSpeed);
@@ -1872,27 +1919,18 @@
         function saveAndDownloadDirect(chunks, name, mime) {
             try {
                 const detectedMime = mime || detectMimeByName(name);
-                // Safari Heap Protection: build blob and immediately purge chunks array from caller
                 const blob = new Blob(chunks, { type: detectedMime || 'application/octet-stream' });
-                
-                // Truncate received chunks array to trigger JS garbage collection immediately
-                chunks.length = 0;
-
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
                 a.download = name;
                 document.body.appendChild(a);
                 a.click();
-                
-                // Immediately release blob URL reference to free Safari WebKit memory pool
                 setTimeout(() => {
                     if (document.body.contains(a)) document.body.removeChild(a);
                     URL.revokeObjectURL(url);
-                }, 150);
-            } catch(e) {
-                console.error("Save error:", e);
-            }
+                }, 300);
+            } catch(e) {}
         }
 
         async function queueFilesForTransfer(files) {
@@ -1948,6 +1986,11 @@
             isTransferCancelled = false;
             updatePauseUI(false);
 
+            // New session: any previous startStreamingChunks loop still alive from a
+            // just-cancelled transfer will see this mismatch on its next check and stop,
+            // even though it can't observe a boolean flag reliably (see note above).
+            const mySession = ++transferSessionId;
+
             currentTransferFile = pendingFileQueue.shift();
             lastAttemptedFile = currentTransferFile;
             
@@ -1972,7 +2015,7 @@
             }
         }
 
-        async function startStreamingChunks(file, resumeOffset = 0) {
+        async function startStreamingChunks(file, resumeOffset = 0, session = transferSessionId) {
             await requestWakeLock();
             const config = getDeviceTransferConfig();
             const { chunkSize, maxBuffer, lowBuffer, blockReadSize, isMobile } = config;
@@ -1995,6 +2038,7 @@
             }
 
             while (offset < file.size) {
+                if (session !== transferSessionId) return; // superseded — stop silently, don't touch shared state
                 if (!isConnected || !activeDataConn || !activeDataConn.open || isTransferCancelled) {
                     abortTransfer();
                     releaseWakeLock();
@@ -2003,6 +2047,7 @@
 
                 while (isTransferPaused) {
                     await new Promise(r => setTimeout(r, 150));
+                    if (session !== transferSessionId) return;
                     if (!isConnected || isTransferCancelled) {
                         abortTransfer();
                         releaseWakeLock();
@@ -2020,6 +2065,7 @@
                 try {
                     blockBuffer = await blockSlice.arrayBuffer();
                 } catch(err) {
+                    if (session !== transferSessionId) return;
                     showToast("Failed to read file block.", "rose");
                     abortTransfer();
                     releaseWakeLock();
@@ -2028,6 +2074,7 @@
 
                 let blockOffset = 0;
                 while (blockOffset < blockBuffer.byteLength) {
+                    if (session !== transferSessionId) return;
                     if (!isConnected || !activeDataConn || !activeDataConn.open || isTransferCancelled) {
                         abortTransfer();
                         releaseWakeLock();
@@ -2036,6 +2083,7 @@
 
                     while (isTransferPaused) {
                         await new Promise(r => setTimeout(r, 150));
+                        if (session !== transferSessionId) return;
                         if (!isConnected || isTransferCancelled) {
                             abortTransfer();
                             releaseWakeLock();
@@ -2047,12 +2095,15 @@
                         await waitForBufferDrain(rawDC, maxBuffer, lowBuffer);
                     }
 
+                    if (session !== transferSessionId) return; // re-check: buffer drain can take a while
+
                     const chunkEnd = Math.min(blockBuffer.byteLength, blockOffset + chunkSize);
                     const chunkData = blockBuffer.slice(blockOffset, chunkEnd);
 
                     try {
                         activeDataConn.send(chunkData);
                     } catch(err) {
+                        if (session !== transferSessionId) return;
                         showToast("Transfer interrupted.", "rose");
                         abortTransfer();
                         releaseWakeLock();
@@ -2070,10 +2121,12 @@
                 }
             }
 
+            if (session !== transferSessionId) return;
+
             if (rawDC && rawDC.bufferedAmount > 0) {
                 await new Promise(resolve => {
                     const drainTimer = setInterval(() => {
-                        if (!rawDC || rawDC.bufferedAmount === 0 || isTransferCancelled) {
+                        if (!rawDC || rawDC.bufferedAmount === 0 || isTransferCancelled || session !== transferSessionId) {
                             clearInterval(drainTimer);
                             resolve();
                         }
@@ -2085,6 +2138,8 @@
                     }, 6000);
                 });
             }
+
+            if (session !== transferSessionId) return;
 
             if (isTransferCancelled) {
                 abortTransfer();
@@ -2151,6 +2206,12 @@
                 opfsWritable = null;
                 opfsFileHandle = null;
             }
+            // Also drop any partially-received data for an aborted incoming transfer —
+            // otherwise a stray leftover chunk or a receiver-side bug elsewhere could
+            // still latch onto a previous file's abandoned incomingMeta/receivedChunks.
+            incomingMeta = null;
+            receivedChunks = [];
+            receivedSize = 0;
             releaseWakeLock();
             hideProgressUI(true);
         }
@@ -2763,10 +2824,17 @@
             row.innerHTML = `
                 <div class="flex justify-between items-center text-[10px] font-bold text-slate-400 font-mono">
                     <span>${isSent ? 'Sent Snippet' : 'Received Snippet'}</span>
-                    <button onclick="copyToClipboard('${escapeHtml(text)}')" class="text-lime-600 dark:text-lime-400 hover:underline">Copy</button>
+                    <button class="copy-snippet-btn text-lime-600 dark:text-lime-400 hover:underline">Copy</button>
                 </div>
                 <p class="text-xs font-mono text-slate-800 dark:text-white whitespace-pre-wrap break-all">${escapeHtml(text)}</p>
             `;
+            // Bind via closure instead of an inline onclick string so a peer-supplied
+            // snippet can never break out of an HTML attribute and execute script
+            // (the old version interpolated escapeHtml(text) into onclick="copyToClipboard('...')",
+            // and escapeHtml() does not escape single quotes, so a snippet like
+            // `'); alert(document.cookie); //` closed the JS string early).
+            const copyBtn = row.querySelector('.copy-snippet-btn');
+            if (copyBtn) copyBtn.addEventListener('click', () => copyToClipboard(text));
             list.prepend(row);
         }
 
@@ -2786,13 +2854,32 @@
         }
 
         function copyToClipboard(str) {
-            const el = document.createElement('textarea');
-            el.value = str;
-            document.body.appendChild(el);
-            el.select();
-            document.execCommand('copy');
-            document.body.removeChild(el);
-            showToast("Copied to clipboard!", "emerald");
+            // navigator.clipboard is the modern, non-deprecated path and is well
+            // supported in Safari on macOS/iOS; execCommand('copy') is deprecated and
+            // kept only as a fallback for older/non-secure contexts.
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(str)
+                    .then(() => showToast("Copied to clipboard!", "emerald"))
+                    .catch(() => legacyCopyFallback(str));
+            } else {
+                legacyCopyFallback(str);
+            }
+        }
+
+        function legacyCopyFallback(str) {
+            try {
+                const el = document.createElement('textarea');
+                el.value = str;
+                el.style.position = 'fixed';
+                el.style.opacity = '0';
+                document.body.appendChild(el);
+                el.select();
+                document.execCommand('copy');
+                document.body.removeChild(el);
+                showToast("Copied to clipboard!", "emerald");
+            } catch (e) {
+                showToast("Couldn't copy to clipboard", "rose");
+            }
         }
 
         function openMediaPreviewByIndex(index) {
@@ -2960,24 +3047,47 @@
             const manifestLink = document.getElementById('pwa-manifest-link');
             if (manifestLink) manifestLink.setAttribute('href', manifestUrl);
 
+            const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+
             window.addEventListener('beforeinstallprompt', (e) => {
                 e.preventDefault();
                 deferredPrompt = e;
                 const pwaBtn = document.getElementById('pwa-install-btn');
                 if (pwaBtn) pwaBtn.classList.remove('hidden');
             });
+
+            // Safari (macOS + iOS) never fires beforeinstallprompt, so without this the
+            // Install button simply never appears there. Show it anyway and, since there's
+            // no programmatic install API, walk the user through the manual Safari steps.
+            if (!isStandalone && isSafariBrowser() && isAppleDevice()) {
+                const pwaBtn = document.getElementById('pwa-install-btn');
+                if (pwaBtn) pwaBtn.classList.remove('hidden');
+            }
         }
 
         async function triggerPwaInstall() {
-            if (!deferredPrompt) return;
-            deferredPrompt.prompt();
-            const { outcome } = await deferredPrompt.userChoice;
-            if (outcome === 'accepted') {
-                showToast("LimeShare installed successfully!", "emerald");
+            if (deferredPrompt) {
+                deferredPrompt.prompt();
+                const { outcome } = await deferredPrompt.userChoice;
+                if (outcome === 'accepted') {
+                    showToast("LimeShare installed successfully!", "emerald");
+                }
+                deferredPrompt = null;
+                const pwaBtn = document.getElementById('pwa-install-btn');
+                if (pwaBtn) pwaBtn.classList.add('hidden');
+                return;
             }
-            deferredPrompt = null;
-            const pwaBtn = document.getElementById('pwa-install-btn');
-            if (pwaBtn) pwaBtn.classList.add('hidden');
+
+            if (isSafariBrowser() && isAppleDevice()) {
+                const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+                const instructions = isIOS
+                    ? "Tap the Share icon, then \"Add to Home Screen\"."
+                    : "Click the Share icon in Safari's toolbar, then \"Add to Dock\".";
+                showToast(instructions, "lime");
+                return;
+            }
+
+            showToast("Your browser doesn't support one-click install here.", "amber");
         }
 
         async function requestWakeLock() {
@@ -3019,7 +3129,10 @@
 
         function escapeHtml(str) {
             if (!str) return '';
-            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+            // Escapes single quotes too (defense in depth) — text embedded in a
+            // single-quoted HTML attribute or JS string is otherwise still exploitable
+            // even though double quotes and angle brackets are handled.
+            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
         }
 
         function initTheme() {
