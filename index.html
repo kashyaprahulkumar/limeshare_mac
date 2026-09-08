@@ -750,12 +750,13 @@
             initTheme();
             initPwaSupport();
             await initDB();
+
+            // Resolve the public IP before peer discovery starts when possible.
+            // setupPresenceBeacon() still has a no-IP fallback, so discovery does not
+            // become permanently disabled when the lookup is blocked or offline.
+            await fetchPublicIP();
             initPeer();
             setupDragAndDrop();
-
-            fetchPublicIP().then(() => {
-                if (typeof sendPresencePing === 'function') sendPresencePing();
-            });
 
             // Bind change event explicitly to file-input
             const fileInput = document.getElementById('file-input');
@@ -1107,24 +1108,41 @@
         }
 
         async function setupPresenceBeacon() {
+            // Clean up a previous discovery session (for example after regenerating
+            // the device code) before starting a new one.
+            if (presenceInterval) {
+                clearInterval(presenceInterval);
+                presenceInterval = null;
+            }
+            if (mqttClient) {
+                try { mqttClient.end(true); } catch(e) {}
+                mqttClient = null;
+            }
+
             if (!broadcastChannel && 'BroadcastChannel' in window) {
-                broadcastChannel = new BroadcastChannel('limeshare_local_lan_ch');
+                try {
+                    broadcastChannel = new BroadcastChannel('limeshare_local_lan_ch');
+                } catch(e) {
+                    broadcastChannel = null;
+                }
             }
 
             if (broadcastChannel) {
                 broadcastChannel.onmessage = (event) => {
                     const data = event.data;
-                    if (!data || data.senderID === myID) return;
+                    if (!data || !data.senderID || data.senderID === myID) return;
 
                     if (data.type === 'presence_ping') {
                         registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
-                        broadcastChannel.postMessage({ 
-                            type: 'presence_pong', 
-                            senderID: myID, 
-                            userName: myUserName, 
-                            targetID: data.senderID, 
-                            deviceType: isMobileDevice() ? 'mobile' : 'laptop' 
-                        });
+                        try {
+                            broadcastChannel.postMessage({
+                                type: 'presence_pong',
+                                senderID: myID,
+                                userName: myUserName,
+                                targetID: data.senderID,
+                                deviceType: isMobileDevice() ? 'mobile' : 'laptop'
+                            });
+                        } catch(e) {}
                     } else if (data.type === 'presence_pong') {
                         if (data.targetID === myID || !data.targetID) {
                             registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
@@ -1133,97 +1151,137 @@
                 };
             }
 
-            if (!myPublicIP) return;
-
-            const wifiSubnetHash = await hashString(myPublicIP);
-            const topicRoom = `ls_subnet_${wifiSubnetHash}`;
-
-            function connectMqttBroker(brokerIndex = 0) {
-                if (brokerIndex >= MQTT_BROKERS.length) return;
-                try {
-                    const brokerUrl = MQTT_BROKERS[brokerIndex];
-                    mqttClient = mqtt.connect(brokerUrl, {
-                        clientId: 'ls_' + myID + '_' + Math.random().toString(16).substr(2, 6),
-                        keepalive: 10,
-                        connectTimeout: 4000
-                    });
-
-                    mqttClient.on('connect', () => {
-                        mqttClient.subscribe(topicRoom);
-                        sendPresencePing();
-                    });
-
-                    mqttClient.on('message', (t, message) => {
-                        try {
-                            const data = JSON.parse(message.toString());
-                            if (!data || !data.senderID || data.senderID === myID) return;
-
-                            if (data.publicIP && myPublicIP && data.publicIP !== myPublicIP) {
-                                return;
-                            }
-
-                            if (data.type === 'presence_ping') {
-                                registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
-                                if (mqttClient && mqttClient.connected) {
-                                    mqttClient.publish(topicRoom, JSON.stringify({
-                                        type: 'presence_pong',
-                                        senderID: myID,
-                                        userName: myUserName,
-                                        publicIP: myPublicIP,
-                                        targetID: data.senderID,
-                                        deviceType: isMobileDevice() ? 'mobile' : 'laptop'
-                                    }));
-                                }
-                            } else if (data.type === 'presence_pong') {
-                                if (data.targetID === myID || !data.targetID) {
-                                    registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
-                                }
-                            }
-                        } catch(e) {}
-                    });
-
-                    mqttClient.on('error', () => {
-                        try { mqttClient.end(); } catch(e) {}
-                        connectMqttBroker(brokerIndex + 1);
-                    });
-                } catch(e) {
-                    connectMqttBroker(brokerIndex + 1);
-                }
-            }
-
-            connectMqttBroker(0);
-
+            // Always define the beacon sender. BroadcastChannel can therefore work
+            // even when public-IP discovery is unavailable. MQTT publishing is added
+            // automatically below when a room can be created.
+            let topicRoom = null;
             window.sendPresencePing = function() {
                 const payload = {
                     type: 'presence_ping',
                     senderID: myID,
                     userName: myUserName,
-                    publicIP: myPublicIP,
+                    publicIP: myPublicIP || null,
                     timestamp: Date.now(),
                     deviceType: isMobileDevice() ? 'mobile' : 'laptop'
                 };
 
-                if (broadcastChannel) broadcastChannel.postMessage(payload);
+                if (broadcastChannel) {
+                    try { broadcastChannel.postMessage(payload); } catch(e) {}
+                }
                 if (mqttClient && mqttClient.connected && topicRoom) {
-                    mqttClient.publish(topicRoom, JSON.stringify(payload));
+                    try { mqttClient.publish(topicRoom, JSON.stringify(payload)); } catch(e) {}
                 }
             };
 
-            if (presenceInterval) clearInterval(presenceInterval);
+            // Start local-tab discovery immediately instead of returning early.
             sendPresencePing();
-            setTimeout(sendPresencePing, 800);
+            setTimeout(() => { if (typeof sendPresencePing === 'function') sendPresencePing(); }, 600);
+
+            // Public-IP lookup can fail because of CORS, content blockers or offline
+            // startup. Retry it here so MQTT discovery still has a chance to start.
+            if (!myPublicIP) {
+                await fetchPublicIP();
+            }
+
+            if (myPublicIP && typeof mqtt !== 'undefined' && mqtt && typeof mqtt.connect === 'function') {
+                const wifiSubnetHash = await hashString(myPublicIP);
+                topicRoom = `ls_subnet_${wifiSubnetHash}`;
+
+                const connectMqttBroker = (brokerIndex = 0) => {
+                    if (brokerIndex >= MQTT_BROKERS.length) {
+                        updateRadarStatus('Online • Discovery fallback active');
+                        return;
+                    }
+
+                    try {
+                        const brokerUrl = MQTT_BROKERS[brokerIndex];
+                        const client = mqtt.connect(brokerUrl, {
+                            clientId: 'ls_' + myID + '_' + Math.random().toString(16).slice(2, 8),
+                            keepalive: 10,
+                            reconnectPeriod: 0,
+                            connectTimeout: 5000,
+                            clean: true
+                        });
+                        mqttClient = client;
+                        let failedOver = false;
+
+                        const failOver = () => {
+                            if (failedOver || mqttClient !== client) return;
+                            failedOver = true;
+                            try { client.end(true); } catch(e) {}
+                            if (mqttClient === client) mqttClient = null;
+                            connectMqttBroker(brokerIndex + 1);
+                        };
+
+                        client.on('connect', () => {
+                            if (mqttClient !== client) return;
+                            client.subscribe(topicRoom, (err) => {
+                                if (err) {
+                                    failOver();
+                                    return;
+                                }
+                                if (typeof sendPresencePing === 'function') {
+                                    sendPresencePing();
+                                    setTimeout(sendPresencePing, 350);
+                                }
+                            });
+                        });
+
+                        client.on('message', (t, message) => {
+                            if (t !== topicRoom) return;
+                            try {
+                                const data = JSON.parse(message.toString());
+                                if (!data || !data.senderID || data.senderID === myID) return;
+
+                                // The MQTT room is already derived from the same public IP.
+                                // Keep this guard as an extra isolation check.
+                                if (data.publicIP && myPublicIP && data.publicIP !== myPublicIP) return;
+
+                                if (data.type === 'presence_ping') {
+                                    registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
+                                    if (client.connected) {
+                                        client.publish(topicRoom, JSON.stringify({
+                                            type: 'presence_pong',
+                                            senderID: myID,
+                                            userName: myUserName,
+                                            publicIP: myPublicIP,
+                                            targetID: data.senderID,
+                                            timestamp: Date.now(),
+                                            deviceType: isMobileDevice() ? 'mobile' : 'laptop'
+                                        }));
+                                    }
+                                } else if (data.type === 'presence_pong') {
+                                    if (data.targetID === myID || !data.targetID) {
+                                        registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
+                                    }
+                                }
+                            } catch(e) {}
+                        });
+
+                        client.on('error', failOver);
+                        client.on('close', () => {
+                            // A close before a successful fail-over should try the next broker.
+                            if (!failedOver && !client.connected) failOver();
+                        });
+                    } catch(e) {
+                        connectMqttBroker(brokerIndex + 1);
+                    }
+                };
+
+                connectMqttBroker(0);
+            }
 
             presenceInterval = setInterval(() => {
                 const now = Date.now();
                 Object.keys(discoveredPeers).forEach(id => {
-                    if (now - (discoveredPeers[id]?.lastSeen || 0) > 12000) {
+                    if (now - (discoveredPeers[id]?.lastSeen || 0) > 15000) {
                         delete discoveredPeers[id];
                     }
                 });
 
-                sendPresencePing();
+                if (typeof sendPresencePing === 'function') sendPresencePing();
                 renderRadarPeers();
-            }, 3500);
+            }, 3000);
         }
 
         function registerDiscoveredPeer(peerID, deviceType = 'laptop', userName = '') {
