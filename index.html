@@ -551,6 +551,10 @@
                     Choose a folder on your hard disk. The file will stream chunk-by-chunk directly into storage with zero RAM usage.
                 </p>
             </div>
+            <label id="batch-remember-row" style="display:none;" class="items-center gap-2 text-left px-1 py-1.5 cursor-pointer">
+                <input type="checkbox" id="batch-remember-folder" class="w-3.5 h-3.5 rounded accent-lime-500 flex-shrink-0">
+                <span class="text-[10px] text-slate-500 dark:text-slate-400 font-medium leading-tight">Use this folder automatically for the rest of this batch — no more prompts</span>
+            </label>
             <div class="flex gap-2 pt-1">
                 <button onclick="declineDiskTransfer()" class="flex-1 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 text-slate-700 dark:text-slate-300 font-bold py-2.5 rounded-xl text-xs transition">
                     Decline
@@ -694,9 +698,14 @@
         let connectingPeerID = null;
         let connectedPeerID = null;
         let dataChannelHeartbeat = null;
+        // Remembered destination folder for the current batch of incoming large
+        // (>=100MB) files, so the user only sees the save prompt once per batch
+        // instead of once per file. Reset whenever a fresh pairing session starts.
+        let batchDestDirHandle = null;
         let statsPollingInterval = null;
         let broadcastChannel = null;
         let mqttClient = null;
+        let mqttDiscoveryStarted = false;
         
         let pendingPeerRequest = null;
         let isAudioMuted = localStorage.getItem('limeshare_audio_muted') === 'true';
@@ -750,13 +759,13 @@
             initTheme();
             initPwaSupport();
             await initDB();
-
-            // Resolve the public IP before peer discovery starts when possible.
-            // setupPresenceBeacon() still has a no-IP fallback, so discovery does not
-            // become permanently disabled when the lookup is blocked or offline.
-            await fetchPublicIP();
             initPeer();
             setupDragAndDrop();
+
+            fetchPublicIP().then(() => {
+                startMqttDiscovery();
+                if (typeof sendPresencePing === 'function') sendPresencePing();
+            });
 
             // Bind change event explicitly to file-input
             const fileInput = document.getElementById('file-input');
@@ -784,8 +793,19 @@
             return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || window.innerWidth < 768;
         }
 
+        // Deliberately ignores window width, unlike isMobileDevice() above. Window
+        // width is a UI-layout signal (fine for icons/labels), not a device-capability
+        // signal — using it here meant a full desktop machine with a narrow or
+        // split-screen browser window got needlessly throttled to mobile-sized
+        // (32KB / 1MB) transfer chunks instead of the faster desktop config
+        // (64KB / 4MB), hurting throughput for a reason unrelated to what the hardware
+        // and network can actually handle.
+        function isMobileUserAgent() {
+            return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        }
+
         function getDeviceTransferConfig() {
-            const mobile = isMobileDevice();
+            const mobile = isMobileUserAgent();
             if (mobile) {
                 return {
                     isMobile: true,
@@ -1015,15 +1035,40 @@
         }
 
         async function fetchPublicIP() {
+            // Previously this raced api.ipify.org (IPv4-only) against Cloudflare's
+            // trace endpoint, whose result depends on whichever IP protocol the
+            // browser's connection happened to use. On a dual-stack network (very
+            // common today) that meant two devices on the *exact same Wi-Fi* could each
+            // end up with a different address — one IPv4 (shared by everyone behind the
+            // router's NAT, which is what actually identifies "same network"), one
+            // IPv6 (globally unique per device, since IPv6 usually isn't NAT'd) —
+            // purely depending on which of the two fetches happened to resolve first.
+            // Different addresses hash to different MQTT topics, so the two devices
+            // would never even subscribe to the same room and could never discover
+            // each other, no matter how long they waited. Pinning to an IPv4-only
+            // source (with one retry) makes the "same network" assumption actually
+            // hold.
+            for (let attempt = 0; attempt < 2; attempt++) {
+                try {
+                    const res = await fetch('https://api.ipify.org?format=json');
+                    const data = await res.json();
+                    if (data && data.ip) {
+                        myPublicIP = data.ip;
+                        localStorage.setItem('ls_cached_ip', data.ip);
+                        return;
+                    }
+                } catch(e) {}
+                if (attempt === 0) await new Promise(r => setTimeout(r, 1500));
+            }
+
+            // ipify unreachable (blocked, offline, etc.) — fall back to Cloudflare's
+            // trace, but only accept an IPv4 result from it for the reason above.
             try {
-                const ip = await Promise.race([
-                    fetch('https://api.ipify.org?format=json').then(r => r.json()).then(d => d.ip),
-                    fetch('https://cloudflare.com/cdn-cgi/trace').then(r => r.text()).then(t => {
-                        const m = t.match(/ip=(.+)/);
-                        return m ? m[1].trim() : null;
-                    })
-                ]);
-                if (ip) {
+                const res = await fetch('https://cloudflare.com/cdn-cgi/trace');
+                const text = await res.text();
+                const m = text.match(/ip=(.+)/);
+                const ip = m ? m[1].trim() : null;
+                if (ip && !ip.includes(':')) {
                     myPublicIP = ip;
                     localStorage.setItem('ls_cached_ip', ip);
                 }
@@ -1107,42 +1152,27 @@
             }
         }
 
-        async function setupPresenceBeacon() {
-            // Clean up a previous discovery session (for example after regenerating
-            // the device code) before starting a new one.
-            if (presenceInterval) {
-                clearInterval(presenceInterval);
-                presenceInterval = null;
-            }
-            if (mqttClient) {
-                try { mqttClient.end(true); } catch(e) {}
-                mqttClient = null;
-            }
+        let topicRoom = null;
 
+        async function setupPresenceBeacon() {
             if (!broadcastChannel && 'BroadcastChannel' in window) {
-                try {
-                    broadcastChannel = new BroadcastChannel('limeshare_local_lan_ch');
-                } catch(e) {
-                    broadcastChannel = null;
-                }
+                broadcastChannel = new BroadcastChannel('limeshare_local_lan_ch');
             }
 
             if (broadcastChannel) {
                 broadcastChannel.onmessage = (event) => {
                     const data = event.data;
-                    if (!data || !data.senderID || data.senderID === myID) return;
+                    if (!data || data.senderID === myID) return;
 
                     if (data.type === 'presence_ping') {
                         registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
-                        try {
-                            broadcastChannel.postMessage({
-                                type: 'presence_pong',
-                                senderID: myID,
-                                userName: myUserName,
-                                targetID: data.senderID,
-                                deviceType: isMobileDevice() ? 'mobile' : 'laptop'
-                            });
-                        } catch(e) {}
+                        broadcastChannel.postMessage({ 
+                            type: 'presence_pong', 
+                            senderID: myID, 
+                            userName: myUserName, 
+                            targetID: data.senderID, 
+                            deviceType: isMobileDevice() ? 'mobile' : 'laptop' 
+                        });
                     } else if (data.type === 'presence_pong') {
                         if (data.targetID === myID || !data.targetID) {
                             registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
@@ -1151,102 +1181,107 @@
                 };
             }
 
-            // Always define the beacon sender. BroadcastChannel can therefore work
-            // even when public-IP discovery is unavailable. MQTT publishing is added
-            // automatically below when a room can be created.
-            let topicRoom = null;
+            // sendPresencePing and the recurring beacon interval used to be defined only
+            // inside the MQTT branch below, which requires myPublicIP to have resolved
+            // first. That meant BroadcastChannel discovery — which needs no network
+            // access at all and should work between two tabs/windows on the same
+            // machine regardless of anything else — silently never ran either, any time
+            // the public-IP lookup was slow, blocked by an ad blocker, or failed on a
+            // restrictive network. Defining it unconditionally here fixes that: MQTT
+            // publishing is simply skipped (via the `topicRoom` check) until
+            // startMqttDiscovery() has one ready.
             window.sendPresencePing = function() {
                 const payload = {
                     type: 'presence_ping',
                     senderID: myID,
                     userName: myUserName,
-                    publicIP: myPublicIP || null,
+                    publicIP: myPublicIP,
                     timestamp: Date.now(),
                     deviceType: isMobileDevice() ? 'mobile' : 'laptop'
                 };
 
-                if (broadcastChannel) {
-                    try { broadcastChannel.postMessage(payload); } catch(e) {}
-                }
+                if (broadcastChannel) broadcastChannel.postMessage(payload);
                 if (mqttClient && mqttClient.connected && topicRoom) {
-                    try { mqttClient.publish(topicRoom, JSON.stringify(payload)); } catch(e) {}
+                    mqttClient.publish(topicRoom, JSON.stringify(payload));
                 }
             };
 
-            // Start local-tab discovery immediately instead of returning early.
+            if (presenceInterval) clearInterval(presenceInterval);
             sendPresencePing();
-            setTimeout(() => { if (typeof sendPresencePing === 'function') sendPresencePing(); }, 600);
+            setTimeout(sendPresencePing, 800);
 
-            // Public-IP lookup can fail because of CORS, content blockers or offline
-            // startup. Retry it here so MQTT discovery still has a chance to start.
-            if (!myPublicIP) {
-                await fetchPublicIP();
-            }
+            presenceInterval = setInterval(() => {
+                const now = Date.now();
+                Object.keys(discoveredPeers).forEach(id => {
+                    if (now - (discoveredPeers[id]?.lastSeen || 0) > 12000) {
+                        delete discoveredPeers[id];
+                    }
+                });
 
-            if (myPublicIP && typeof mqtt !== 'undefined' && mqtt && typeof mqtt.connect === 'function') {
-                const wifiSubnetHash = await hashString(myPublicIP);
+                sendPresencePing();
+                renderRadarPeers();
+            }, 3500);
+
+            if (myPublicIP) startMqttDiscovery();
+        }
+
+        // Split out from setupPresenceBeacon() because of a startup-ordering bug: this
+        // whole block used to be gated on `if (!myPublicIP) return;` inside
+        // setupPresenceBeacon(), which initPeer() calls synchronously on page load —
+        // before fetchPublicIP() (a separate, un-awaited network call) has resolved.
+        // On a first-ever visit myPublicIP is null at that moment, so this returned
+        // immediately, mqttClient was never created, and window.sendPresencePing was
+        // never defined — auto-discovery of other devices silently never started, even
+        // though fetchPublicIP().then(() => sendPresencePing()) ran moments later,
+        // because the function it was calling didn't exist yet. Making this its own
+        // function, guarded by mqttDiscoveryStarted, lets it be (re)triggered once
+        // myPublicIP is actually known, however that happens to occur.
+        function startMqttDiscovery() {
+            if (mqttDiscoveryStarted || !myPublicIP) return;
+            mqttDiscoveryStarted = true;
+
+            updateRadarStatus("Scanning for nearby devices...");
+
+            hashString(myPublicIP).then(wifiSubnetHash => {
                 topicRoom = `ls_subnet_${wifiSubnetHash}`;
 
-                const connectMqttBroker = (brokerIndex = 0) => {
+                function connectMqttBroker(brokerIndex = 0) {
                     if (brokerIndex >= MQTT_BROKERS.length) {
-                        updateRadarStatus('Online • Discovery fallback active');
+                        updateRadarStatus("Nearby scan unavailable — pair manually");
                         return;
                     }
-
                     try {
                         const brokerUrl = MQTT_BROKERS[brokerIndex];
-                        const client = mqtt.connect(brokerUrl, {
-                            clientId: 'ls_' + myID + '_' + Math.random().toString(16).slice(2, 8),
+                        mqttClient = mqtt.connect(brokerUrl, {
+                            clientId: 'ls_' + myID + '_' + Math.random().toString(16).substr(2, 6),
                             keepalive: 10,
-                            reconnectPeriod: 0,
-                            connectTimeout: 5000,
-                            clean: true
-                        });
-                        mqttClient = client;
-                        let failedOver = false;
-
-                        const failOver = () => {
-                            if (failedOver || mqttClient !== client) return;
-                            failedOver = true;
-                            try { client.end(true); } catch(e) {}
-                            if (mqttClient === client) mqttClient = null;
-                            connectMqttBroker(brokerIndex + 1);
-                        };
-
-                        client.on('connect', () => {
-                            if (mqttClient !== client) return;
-                            client.subscribe(topicRoom, (err) => {
-                                if (err) {
-                                    failOver();
-                                    return;
-                                }
-                                if (typeof sendPresencePing === 'function') {
-                                    sendPresencePing();
-                                    setTimeout(sendPresencePing, 350);
-                                }
-                            });
+                            connectTimeout: 4000
                         });
 
-                        client.on('message', (t, message) => {
-                            if (t !== topicRoom) return;
+                        mqttClient.on('connect', () => {
+                            mqttClient.subscribe(topicRoom);
+                            sendPresencePing();
+                            if (!isConnected && !connectingPeerID) updateRadarStatus("Online • Ready");
+                        });
+
+                        mqttClient.on('message', (t, message) => {
                             try {
                                 const data = JSON.parse(message.toString());
                                 if (!data || !data.senderID || data.senderID === myID) return;
 
-                                // The MQTT room is already derived from the same public IP.
-                                // Keep this guard as an extra isolation check.
-                                if (data.publicIP && myPublicIP && data.publicIP !== myPublicIP) return;
+                                if (data.publicIP && myPublicIP && data.publicIP !== myPublicIP) {
+                                    return;
+                                }
 
                                 if (data.type === 'presence_ping') {
                                     registerDiscoveredPeer(data.senderID, data.deviceType, data.userName);
-                                    if (client.connected) {
-                                        client.publish(topicRoom, JSON.stringify({
+                                    if (mqttClient && mqttClient.connected) {
+                                        mqttClient.publish(topicRoom, JSON.stringify({
                                             type: 'presence_pong',
                                             senderID: myID,
                                             userName: myUserName,
                                             publicIP: myPublicIP,
                                             targetID: data.senderID,
-                                            timestamp: Date.now(),
                                             deviceType: isMobileDevice() ? 'mobile' : 'laptop'
                                         }));
                                     }
@@ -1258,30 +1293,19 @@
                             } catch(e) {}
                         });
 
-                        client.on('error', failOver);
-                        client.on('close', () => {
-                            // A close before a successful fail-over should try the next broker.
-                            if (!failedOver && !client.connected) failOver();
+                        mqttClient.on('error', () => {
+                            try { mqttClient.end(); } catch(e) {}
+                            connectMqttBroker(brokerIndex + 1);
                         });
                     } catch(e) {
                         connectMqttBroker(brokerIndex + 1);
                     }
-                };
+                }
 
                 connectMqttBroker(0);
-            }
-
-            presenceInterval = setInterval(() => {
-                const now = Date.now();
-                Object.keys(discoveredPeers).forEach(id => {
-                    if (now - (discoveredPeers[id]?.lastSeen || 0) > 15000) {
-                        delete discoveredPeers[id];
-                    }
-                });
-
-                if (typeof sendPresencePing === 'function') sendPresencePing();
-                renderRadarPeers();
-            }, 3000);
+            }).catch(() => {
+                updateRadarStatus("Nearby scan unavailable — pair manually");
+            });
         }
 
         function registerDiscoveredPeer(peerID, deviceType = 'laptop', userName = '') {
@@ -1469,6 +1493,10 @@
             connectingPeerID = null;
             isConnected = true;
             connectedPeerID = peerID;
+
+            // A new pairing session is a new batch — don't silently keep write access
+            // to whatever folder was picked for a previous, unrelated connection.
+            batchDestDirHandle = null;
 
             // Auto-minimize/close pairing modal on connection
             closePairingModal();
@@ -1687,14 +1715,32 @@
             const isLarge = (data.size >= DIRECT_STORAGE_THRESHOLD) || data.isDirectStorage || (data.size >= DIRECT_DOWNLOAD_THRESHOLD);
 
             if (isLarge) {
+                // If a folder was already picked earlier in this batch (via the
+                // "remember" checkbox), skip the prompt entirely and write straight
+                // into it — this is the fix for being asked to save 10 separate times
+                // when receiving 10 large files back to back.
+                if (batchDestDirHandle) {
+                    await autoAcceptToBatchFolder(data);
+                    return;
+                }
+
                 // Large File (>=100MB): Prompt receiver to choose destination storage BEFORE transfer starts!
                 // This gives transient user activation to showSaveFilePicker so chunks stream directly to hard disk
                 const promptCard = document.getElementById('disk-prompt-card');
                 const nameEl = document.getElementById('disk-prompt-filename');
                 const sizeEl = document.getElementById('disk-prompt-filesize');
+                const rememberRow = document.getElementById('batch-remember-row');
+                const rememberCheckbox = document.getElementById('batch-remember-folder');
 
                 if (nameEl) nameEl.innerText = data.name;
                 if (sizeEl) sizeEl.innerText = formatBytes(data.size);
+                if (rememberCheckbox) rememberCheckbox.checked = false;
+                if (rememberRow) {
+                    // showDirectoryPicker is what makes "remember for the batch" possible
+                    // (it grants access to a whole folder, not just one file), so only
+                    // offer the option where it's actually supported.
+                    rememberRow.style.display = ('showDirectoryPicker' in window) ? 'flex' : 'none';
+                }
                 if (promptCard) promptCard.classList.remove('hidden');
                 lucide.createIcons();
             } else {
@@ -1712,8 +1758,28 @@
             if (!incomingMeta || !activeDataConn || !activeDataConn.open) return;
 
             const fileName = incomingMeta.name;
+            const rememberFolder = document.getElementById('batch-remember-folder')?.checked
+                && ('showDirectoryPicker' in window);
 
-            if ('showSaveFilePicker' in window) {
+            if (rememberFolder) {
+                try {
+                    const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                    batchDestDirHandle = dirHandle;
+                    directFileHandle = await dirHandle.getFileHandle(fileName, { create: true });
+                    directWritableStream = await directFileHandle.createWritable();
+                } catch (err) {
+                    if (err.name === 'AbortError') {
+                        showToast("Folder selection cancelled", "rose");
+                        if (activeDataConn && activeDataConn.open) {
+                            sendControlMessage(activeDataConn, { type: 'transfer_cancel' });
+                        }
+                        incomingMeta = null;
+                        return;
+                    }
+                    batchDestDirHandle = null;
+                    directWritableStream = null;
+                }
+            } else if ('showSaveFilePicker' in window) {
                 try {
                     directFileHandle = await window.showSaveFilePicker({
                         suggestedName: fileName
@@ -1742,7 +1808,46 @@
             sendControlMessage(activeDataConn, { type: 'accept', name: fileName, resumeOffset: 0 });
             showProgressUI(fileName, false, incomingMeta.size);
             updateProgressUI(0, incomingMeta.size);
-            showToast(`Streaming ${fileName} directly to storage...`, "emerald");
+            showToast(
+                batchDestDirHandle ? `Streaming ${fileName} to your chosen folder...` : `Streaming ${fileName} directly to storage...`,
+                "emerald"
+            );
+        }
+
+        // Used once batchDestDirHandle is already set from an earlier file in this
+        // batch: writes straight into the remembered folder with no prompt at all.
+        async function autoAcceptToBatchFolder(data) {
+            if (!activeDataConn || !activeDataConn.open) return;
+
+            receivedChunks = [];
+            receivedSize = 0;
+            directWritableStream = null;
+            directFileHandle = null;
+
+            try {
+                directFileHandle = await batchDestDirHandle.getFileHandle(data.name, { create: true });
+                directWritableStream = await directFileHandle.createWritable();
+            } catch (err) {
+                // Permission on the remembered handle was revoked, or some other
+                // failure — fall back to asking again for just this one file rather
+                // than silently dropping the transfer.
+                batchDestDirHandle = null;
+                const promptCard = document.getElementById('disk-prompt-card');
+                const nameEl = document.getElementById('disk-prompt-filename');
+                const sizeEl = document.getElementById('disk-prompt-filesize');
+                const rememberRow = document.getElementById('batch-remember-row');
+                if (nameEl) nameEl.innerText = data.name;
+                if (sizeEl) sizeEl.innerText = formatBytes(data.size);
+                if (rememberRow) rememberRow.style.display = ('showDirectoryPicker' in window) ? 'flex' : 'none';
+                if (promptCard) promptCard.classList.remove('hidden');
+                lucide.createIcons();
+                return;
+            }
+
+            sendControlMessage(activeDataConn, { type: 'accept', name: data.name, resumeOffset: 0 });
+            showProgressUI(data.name, false, data.size);
+            updateProgressUI(0, data.size);
+            showToast(`Streaming ${data.name} to your chosen folder...`, "emerald");
         }
 
         function declineDiskTransfer() {
