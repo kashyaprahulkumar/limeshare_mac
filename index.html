@@ -551,9 +551,9 @@
                     Choose a folder on your hard disk. The file will stream chunk-by-chunk directly into storage with zero RAM usage.
                 </p>
             </div>
-            <label id="batch-remember-row" style="display:none;" class="items-center gap-2 text-left px-1 py-1.5 cursor-pointer">
-                <input type="checkbox" id="batch-remember-folder" class="w-3.5 h-3.5 rounded accent-lime-500 flex-shrink-0">
-                <span class="text-[10px] text-slate-500 dark:text-slate-400 font-medium leading-tight">Use this folder automatically for the rest of this batch — no more prompts</span>
+            <label id="batch-remember-row" style="display:none;" class="items-center gap-2.5 text-left px-1 py-2 cursor-pointer">
+                <input type="checkbox" id="batch-remember-folder" class="w-4 h-4 rounded accent-lime-500 flex-shrink-0">
+                <span class="text-xs text-slate-600 dark:text-slate-300 font-semibold leading-snug">Use this folder automatically for the rest of this batch — no more prompts</span>
             </label>
             <div class="flex gap-2 pt-1">
                 <button onclick="declineDiskTransfer()" class="flex-1 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 text-slate-700 dark:text-slate-300 font-bold py-2.5 rounded-xl text-xs transition">
@@ -809,18 +809,23 @@
             if (mobile) {
                 return {
                     isMobile: true,
-                    chunkSize: 32768,           
-                    maxBuffer: 1024 * 1024,     
-                    lowBuffer: 256 * 1024,      
-                    blockReadSize: 1024 * 1024  
+                    chunkSize: 65536,           // was 32768 — fewer send() calls per MB
+                    maxBuffer: 2 * 1024 * 1024, // was 1MB — fewer backpressure stalls
+                    lowBuffer: 512 * 1024,      // was 256KB
+                    blockReadSize: 2 * 1024 * 1024  // was 1MB
                 };
             } else {
                 return {
                     isMobile: false,
-                    chunkSize: 65536,           
-                    maxBuffer: 4 * 1024 * 1024, 
-                    lowBuffer: 1024 * 1024,     
-                    blockReadSize: 4 * 1024 * 1024 
+                    chunkSize: 262144,           // was 65536 (64KB) — modern desktop
+                                                  // browsers handle 256KB data-channel
+                                                  // messages comfortably; fewer, bigger
+                                                  // sends cut per-message overhead
+                    maxBuffer: 16 * 1024 * 1024, // was 4MB — lets more data queue before
+                                                  // pausing to drain, so the sender
+                                                  // spends less time idle waiting
+                    lowBuffer: 4 * 1024 * 1024,  // was 1MB
+                    blockReadSize: 16 * 1024 * 1024 // was 4MB
                 };
             }
         }
@@ -1878,7 +1883,8 @@
                 // Batch is fully completed
                 activeBatchIsDirect = false;
                 activeBatchTotalSize = 0;
-                setTimeout(() => hideProgressUI(false), 1500);
+                if (hideTimeout) clearTimeout(hideTimeout);
+                hideTimeout = setTimeout(() => hideProgressUI(false), 1500);
             }
         }
 
@@ -2072,7 +2078,17 @@
                 receivedChunks = [];
                 receivedSize = 0;
 
-                setTimeout(() => hideProgressUI(true), 1200);
+                // This used to be a bare, untracked setTimeout, so it couldn't be
+                // cancelled by showProgressUI()'s `clearTimeout(hideTimeout)` when the
+                // next file in a batch starts. With manual per-file Save-As dialogs
+                // that gap was usually long enough to hide anyway, so it went
+                // unnoticed — but with the batch auto-accept flow, the next file's
+                // offer can arrive well within this 1200ms window, and this stale
+                // timer would then force the progress card to hidden.add mid-transfer
+                // for that next file, seconds after it actually started. Storing it in
+                // `hideTimeout` lets showProgressUI() properly cancel it.
+                if (hideTimeout) clearTimeout(hideTimeout);
+                hideTimeout = setTimeout(() => hideProgressUI(true), 1200);
                 resetFileInputs();
             } catch (err) {
                 hideProgressUI(true);
@@ -2260,17 +2276,29 @@
 
                     if (session !== transferSessionId) return; // re-check: buffer drain can take a while
 
-                    const chunkEnd = Math.min(blockBuffer.byteLength, blockOffset + chunkSize);
-                    const chunkData = blockBuffer.slice(blockOffset, chunkEnd);
+                    let chunkEnd = Math.min(blockBuffer.byteLength, blockOffset + chunkSize);
+                    let chunkData = blockBuffer.slice(blockOffset, chunkEnd);
 
                     try {
                         activeDataConn.send(chunkData);
                     } catch(err) {
                         if (session !== transferSessionId) return;
-                        showToast("Transfer interrupted.", "rose");
-                        abortTransfer();
-                        releaseWakeLock();
-                        return;
+                        // With the larger 256KB/64KB chunk sizes, a rare browser/OS
+                        // combination could reject a single message as too large
+                        // (SCTP max-message-size varies). Rather than aborting the
+                        // whole transfer over one oversized message, retry that same
+                        // slice at a quarter the size once — cheap insurance that only
+                        // ever triggers on that unusual path.
+                        try {
+                            const smallerEnd = Math.min(blockBuffer.byteLength, blockOffset + Math.max(16384, Math.floor(chunkSize / 4)));
+                            chunkData = blockBuffer.slice(blockOffset, smallerEnd);
+                            activeDataConn.send(chunkData);
+                        } catch(err2) {
+                            showToast("Transfer interrupted.", "rose");
+                            abortTransfer();
+                            releaseWakeLock();
+                            return;
+                        }
                     }
 
                     blockOffset += chunkData.byteLength;
